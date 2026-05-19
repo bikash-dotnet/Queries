@@ -1,0 +1,71 @@
+db.collection.aggregate([
+  { $unwind: "$groups" },
+  {
+    $group: {
+      _id: {
+        docId: "$_id",
+        groupName: "$groups.name"
+      },
+      soeid: { $first: "$soeid" },
+      dateupdated: { $first: "$dateupdated" },
+      group: { $first: "$groups" },
+      allGroups: { $push: "$groups" }
+    }
+  },
+  {
+    $group: {
+      _id: "$_id.docId",
+      soeid: { $first: "$soeid" },
+      dateupdated: { $first: "$dateupdated" },
+      groups: {
+        $push: {
+          name: "$group.name",
+          _id: "$group._id",
+          roles: "$group.roles"
+        }
+      }
+    }
+  },
+  {
+    $addFields: {
+      groups: {
+        $map: {
+          input: "$groups",
+          as: "group",
+          in: {
+            name: "$$group.name",
+            _id: "$$group._id",
+            roles: {
+              $reduce: {
+                input: "$$group.roles",
+                initialValue: [],
+                in: {
+                  $cond: {
+                    if: {
+                      $in: [
+                        "$$this.role",
+                        { $map: { input: "$$value", as: "v", in: "$$v.role" } }
+                      ]
+                    },
+                    then: "$$value",
+                    else: {
+                      $concatArrays: [
+                        "$$value",
+                        [{
+                          role: "$$this.role",
+                          id: "$$this.id",
+                          permissions: { $setUnion: ["$$this.permissions", []] }
+                        }]
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  { $merge: { into: "collection", on: "_id", whenMatched: "replace" } }
+])
