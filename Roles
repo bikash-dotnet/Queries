@@ -1,0 +1,110 @@
+db.collection.aggregate([
+  {
+    $addFields: {
+      groups: {
+        $reduce: {
+          input: "$groups",
+          initialValue: [],
+          in: {
+            $let: {
+              vars: {
+                existingGroup: {
+                  $first: {
+                    $filter: {
+                      input: "$$value",
+                      cond: { $eq: ["$$this.name", "$$this.name"] }
+                    }
+                  }
+                },
+                currentGroup: "$$this"
+              },
+              in: {
+                $cond: {
+                  if: { $ne: ["$$existingGroup", null] },
+                  then: {
+                    $map: {
+                      input: "$$value",
+                      as: "group",
+                      in: {
+                        $cond: {
+                          if: { $eq: ["$$group.name", "$$currentGroup.name"] },
+                          then: {
+                            name: "$$group.name",
+                            _id: "$$group._id",
+                            roles: {
+                              $reduce: {
+                                input: { $concatArrays: ["$$group.roles", "$$currentGroup.roles"] },
+                                initialValue: [],
+                                in: {
+                                  $cond: {
+                                    if: {
+                                      $in: [
+                                        "$$this.role",
+                                        { $map: { input: "$$value", as: "v", in: "$$v.role" } }
+                                      ]
+                                    },
+                                    then: "$$value",
+                                    else: {
+                                      $concatArrays: [
+                                        "$$value",
+                                        [{
+                                          role: "$$this.role",
+                                          id: "$$this.id",
+                                          permission: { $setUnion: ["$$this.permission", "$$this.permission"] }
+                                        }]
+                                      ]
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          },
+                          else: "$$group"
+                        }
+                      }
+                    }
+                  },
+                  else: {
+                    $concatArrays: [
+                      "$$value",
+                      [{
+                        name: "$$currentGroup.name",
+                        _id: "$$currentGroup._id",
+                        roles: "$$currentGroup.roles"
+                      }]
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    $addFields: {
+      groups: {
+        $map: {
+          input: "$groups",
+          as: "group",
+          in: {
+            name: "$$group.name",
+            _id: "$$group._id",
+            roles: {
+              $map: {
+                input: "$$group.roles",
+                as: "role",
+                in: {
+                  role: "$$role.role",
+                  id: "$$role.id",
+                  permission: { $setUnion: ["$$role.permission", []] }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+])
