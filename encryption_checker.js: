@@ -1,0 +1,413 @@
+const { MongoClient } = require('mongodb');
+const crypto = require('crypto');
+const fs = require('fs');
+
+class EncryptedFieldChecker {
+    constructor(mongodbUri, databaseName, collectionName, encryptionKey = null, keyFile = null) {
+        this.mongodbUri = mongodbUri;
+        this.databaseName = databaseName;
+        this.collectionName = collectionName;
+        this.client = null;
+        this.db = null;
+        this.collection = null;
+        
+        // Initialize encryption
+        if (encryptionKey) {
+            this.encryptionKey = encryptionKey;
+            this.cipherKey = null;
+        } else if (keyFile && fs.existsSync(keyFile)) {
+            this.encryptionKey = fs.readFileSync(keyFile, 'utf8');
+        } else {
+            this.encryptionKey = null;
+            console.warn('⚠️  Warning: No encryption key provided. Will only check for encrypted field format.');
+        }
+    }
+    
+    async connect() {
+        try {
+            this.client = new MongoClient(this.mongodbUri);
+            await this.client.connect();
+            this.db = this.client.db(this.databaseName);
+            this.collection = this.db.collection(this.collectionName);
+            console.log('✅ Connected to MongoDB successfully');
+            console.log(`📊 Database: ${this.databaseName}, Collection: ${this.collectionName}`);
+        } catch (error) {
+            console.error('❌ Failed to connect to MongoDB:', error.message);
+            throw error;
+        }
+    }
+    
+    async disconnect() {
+        if (this.client) {
+            await this.client.close();
+            console.log('🔌 Disconnected from MongoDB');
+        }
+    }
+    
+    // Initialize cipher key for encryption/decryption
+    getCipherKey() {
+        if (!this.cipherKey && this.encryptionKey) {
+            // Use consistent key derivation
+            this.cipherKey = crypto.scryptSync(this.encryptionKey, 'salt', 32);
+        }
+        return this.cipherKey;
+    }
+    
+    // Check if value appears to be encrypted
+    static isEncryptedValue(value) {
+        if (typeof value !== 'string') return false;
+        
+        // Check for typical encrypted patterns
+        const patterns = [
+            value.startsWith('gAAAAA'),  // Fernet pattern
+            value.length > 50 && value.endsWith('='),  // Base64 pattern
+            value.includes('=') && value.length % 4 === 0  // Possible base64
+        ];
+        
+        return patterns.some(pattern => pattern === true);
+    }
+    
+    // Attempt to decrypt a value
+    tryDecrypt(encryptedValue) {
+        if (!this.encryptionKey) {
+            return { success: false, error: 'No encryption key available' };
+        }
+        
+        try {
+            const key = this.getCipherKey();
+            
+            // Check if it's valid base64
+            let encryptedBuffer;
+            try {
+                encryptedBuffer = Buffer.from(encryptedValue, 'base64');
+            } catch (e) {
+                return { success: false, error: 'Invalid base64 encoding' };
+            }
+            
+            // For AES-256-CBC decryption (assuming IV is first 16 bytes)
+            if (encryptedBuffer.length < 16) {
+                return { success: false, error: 'Encrypted data too short' };
+            }
+            
+            const iv = encryptedBuffer.slice(0, 16);
+            const encryptedText = encryptedBuffer.slice(16);
+            
+            const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+            let decrypted = decipher.update(encryptedText, '', 'utf8');
+            decrypted += decipher.final('utf8');
+            
+            // Try to parse as JSON
+            try {
+                const parsed = JSON.parse(decrypted);
+                return { success: true, value: parsed };
+            } catch {
+                return { success: true, value: decrypted };
+            }
+        } catch (error) {
+            return { success: false, error: `Decryption failed: ${error.message}` };
+        }
+    }
+    
+    // Recursively traverse document
+    traverseDocument(doc, encryptedFields, currentPath = '') {
+        const issues = [];
+        
+        for (const [key, value] of Object.entries(doc)) {
+            const fieldPath = currentPath ? `${currentPath}.${key}` : key;
+            
+            // Check if this field should be encrypted
+            if (encryptedFields.has(fieldPath) || encryptedFields.has(key)) {
+                // Skip null values - they're optional and valid
+                if (value === null) {
+                    continue;
+                }
+                
+                // Check if value is a string
+                if (typeof value !== 'string') {
+                    issues.push({
+                        fieldPath,
+                        originalValue: String(value).substring(0, 100),
+                        error: `Field type is ${typeof value}, expected encrypted string`,
+                        documentId: doc._id
+                    });
+                    continue;
+                }
+                
+                // Check if value is empty
+                if (value.length === 0) {
+                    issues.push({
+                        fieldPath,
+                        originalValue: '',
+                        error: 'Field is empty string',
+                        documentId: doc._id
+                    });
+                    continue;
+                }
+                
+                // Check if it looks like an encrypted value
+                if (EncryptedFieldChecker.isEncryptedValue(value)) {
+                    // Try to decrypt
+                    const result = this.tryDecrypt(value);
+                    if (!result.success) {
+                        issues.push({
+                            fieldPath,
+                            originalValue: value.length > 100 ? value.substring(0, 100) + '...' : value,
+                            error: result.error,
+                            documentId: doc._id
+                        });
+                    }
+                } else {
+                    // Value exists but doesn't look encrypted
+                    issues.push({
+                        fieldPath,
+                        originalValue: value.length > 100 ? value.substring(0, 100) + '...' : value,
+                        error: 'Value exists but does not appear to be encrypted',
+                        documentId: doc._id
+                    });
+                }
+            }
+            
+            // Recursively traverse nested structures
+            if (value && typeof value === 'object' && !Array.isArray(value)) {
+                issues.push(...this.traverseDocument(value, encryptedFields, fieldPath));
+            } else if (Array.isArray(value)) {
+                for (let idx = 0; idx < value.length; idx++) {
+                    const item = value[idx];
+                    if (item && typeof item === 'object') {
+                        issues.push(...this.traverseDocument(item, encryptedFields, `${fieldPath}[${idx}]`));
+                    }
+                }
+            }
+        }
+        
+        return issues;
+    }
+    
+    // Find documents with undecryptable fields
+    async findUndecryptableFields(encryptedFields, queryFilter = {}, limit = null) {
+        const encryptedSet = new Set(encryptedFields);
+        
+        // Build projection to optimize query
+        const projection = { _id: 1 };
+        for (const field of encryptedFields) {
+            if (field.includes('.')) {
+                const parentField = field.split('.')[0];
+                projection[parentField] = 1;
+            } else {
+                projection[field] = 1;
+            }
+        }
+        
+        let cursor = this.collection.find(queryFilter, { projection });
+        if (limit) {
+            cursor = cursor.limit(limit);
+        }
+        
+        const results = {
+            totalDocumentsChecked: 0,
+            documentsWithIssues: [],
+            totalIssuesFound: 0,
+            issuesByField: {},
+            checkTimestamp: new Date().toISOString(),
+            encryptedFieldsChecked: encryptedFields
+        };
+        
+        console.log('🔍 Scanning documents...');
+        
+        await cursor.forEach(doc => {
+            results.totalDocumentsChecked++;
+            const docIssues = this.traverseDocument(doc, encryptedSet);
+            
+            if (docIssues.length > 0) {
+                results.documentsWithIssues.push({
+                    documentId: doc._id,
+                    issues: docIssues
+                });
+                results.totalIssuesFound += docIssues.length;
+                
+                // Aggregate issues by field
+                for (const issue of docIssues) {
+                    const field = issue.fieldPath;
+                    results.issuesByField[field] = (results.issuesByField[field] || 0) + 1;
+                }
+            }
+            
+            // Progress indicator
+            if (results.totalDocumentsChecked % 100 === 0) {
+                console.log(`   Processed ${results.totalDocumentsChecked} documents...`);
+            }
+        });
+        
+        console.log(`✅ Scan complete. Processed ${results.totalDocumentsChecked} documents.`);
+        
+        return results;
+    }
+    
+    // Generate report
+    generateReport(results, outputFile = null, verbose = false) {
+        const reportLines = [];
+        
+        reportLines.push('='.repeat(80));
+        reportLines.push('🔐 ENCRYPTED FIELD DECRYPTION REPORT');
+        reportLines.push('='.repeat(80));
+        reportLines.push(`📅 Check performed at: ${results.checkTimestamp}`);
+        reportLines.push(`📄 Total documents checked: ${results.totalDocumentsChecked}`);
+        reportLines.push(`⚠️  Total issues found: ${results.totalIssuesFound}`);
+        reportLines.push(`🔑 Encrypted fields checked: ${results.encryptedFieldsChecked.join(', ')}`);
+        
+        if (Object.keys(results.issuesByField).length > 0) {
+            reportLines.push('\n📊 ISSUES BY FIELD:');
+            reportLines.push('-'.repeat(40));
+            const sortedFields = Object.entries(results.issuesByField)
+                .sort((a, b) => b[1] - a[1]);
+            for (const [field, count] of sortedFields) {
+                const percentage = ((count / results.totalIssuesFound) * 100).toFixed(1);
+                reportLines.push(`  ${field}: ${count} issue(s) (${percentage}%)`);
+            }
+        }
+        
+        if (results.documentsWithIssues.length > 0) {
+            reportLines.push('\n📝 DETAILED ISSUES:');
+            reportLines.push('-'.repeat(40));
+            
+            for (const docIssue of results.documentsWithIssues) {
+                reportLines.push(`\n📄 Document ID: ${docIssue.documentId}`);
+                for (const issue of docIssue.issues) {
+                    reportLines.push(`  • Field: ${issue.fieldPath}`);
+                    reportLines.push(`    Error: ${issue.error}`);
+                    if (verbose && issue.originalValue) {
+                        reportLines.push(`    Value: ${issue.originalValue}`);
+                    }
+                }
+            }
+        } else {
+            reportLines.push('\n✅ No issues found! All encrypted fields can be decrypted successfully or are correctly set to null.');
+        }
+        
+        reportLines.push('\n' + '='.repeat(80));
+        reportLines.push('💡 Note: NULL values in encrypted fields are considered valid (optional fields)');
+        reportLines.push('='.repeat(80));
+        
+        const reportText = reportLines.join('\n');
+        console.log('\n' + reportText);
+        
+        if (outputFile) {
+            fs.writeFileSync(outputFile, reportText);
+            console.log(`\n💾 Report saved to ${outputFile}`);
+        }
+        
+        return reportText;
+    }
+}
+
+// Main execution function
+async function main() {
+    console.log('\n🚀 MongoDB Encrypted Field Checker');
+    console.log('='.repeat(40));
+    
+    // ==================== CONFIGURATION ====================
+    // Update these values for your environment
+    const MONGODB_URI = "mongodb://localhost:27017/";
+    const DATABASE_NAME = "your_database";
+    const COLLECTION_NAME = "your_collection";
+    
+    // List of fields that are encrypted (supports nested paths like "address.street")
+    const ENCRYPTED_FIELDS = [
+        "email",
+        "ssn",
+        "credit_card",
+        "address.street",
+        "user.profile.phone"
+    ];
+    
+    // Encryption key options (choose one):
+    // Option 1: From environment variable
+    const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || null;
+    
+    // Option 2: From key file
+    const KEY_FILE = "encryption.key";
+    
+    // Option 3: Hardcoded (not recommended for production)
+    // const ENCRYPTION_KEY = "your-base64-encoded-key-here";
+    
+    // Optional: Add query filter to check specific documents
+    const QUERY_FILTER = {};  // Check all documents
+    // const QUERY_FILTER = { status: "active" };  // Only active documents
+    // const QUERY_FILTER = { createdAt: { $gte: new Date("2024-01-01") } };  // Date range
+    
+    // Optional: Limit number of documents to check
+    const LIMIT = null;  // Check all documents
+    // const LIMIT = 1000;  // Check only first 1000 documents
+    
+    // Optional: Verbose output (shows values)
+    const VERBOSE = true;
+    
+    // Output report file
+    const OUTPUT_FILE = "encryption_check_report.txt";
+    // ======================================================
+    
+    // Create checker instance
+    const checker = new EncryptedFieldChecker(
+        MONGODB_URI,
+        DATABASE_NAME,
+        COLLECTION_NAME,
+        ENCRYPTION_KEY,
+        KEY_FILE
+    );
+    
+    try {
+        // Connect to MongoDB
+        await checker.connect();
+        
+        // Get collection stats
+        const totalDocs = await checker.collection.countDocuments(QUERY_FILTER);
+        console.log(`📊 Total documents to check: ${totalDocs}`);
+        
+        if (totalDocs === 0) {
+            console.log('⚠️  No documents found matching the filter.');
+            return;
+        }
+        
+        // Confirm before proceeding with large collections
+        if (totalDocs > 10000) {
+            console.log(`\n⚠️  Warning: This will check ${totalDocs} documents which may take some time.`);
+            console.log('Press Ctrl+C to cancel or wait to continue...');
+            await new Promise(resolve => setTimeout(resolve, 3000));
+        }
+        
+        // Find undecryptable fields
+        const results = await checker.findUndecryptableFields(
+            ENCRYPTED_FIELDS,
+            QUERY_FILTER,
+            LIMIT
+        );
+        
+        // Generate report
+        checker.generateReport(results, OUTPUT_FILE, VERBOSE);
+        
+        // Exit with appropriate code
+        if (results.totalIssuesFound > 0) {
+            console.log(`\n⚠️  Found ${results.totalIssuesFound} issue(s) that need attention.`);
+            process.exit(1);
+        } else {
+            console.log('\n✅ All encrypted fields are valid!');
+            process.exit(0);
+        }
+        
+    } catch (error) {
+        console.error('\n❌ Error:', error.message);
+        if (error.stack) {
+            console.error(error.stack);
+        }
+        process.exit(1);
+    } finally {
+        await checker.disconnect();
+    }
+}
+
+// Run the application
+if (require.main === module) {
+    main().catch(console.error);
+}
+
+module.exports = EncryptedFieldChecker;
