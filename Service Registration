@@ -1,0 +1,36 @@
+// Program.cs
+var builder = WebApplication.CreateBuilder(args);
+
+// Add Kubernetes client
+builder.Services.AddSingleton<IKubernetes>(sp =>
+{
+    try
+    {
+        var config = KubernetesClientConfiguration.InClusterConfig();
+        return new Kubernetes(config);
+    }
+    catch
+    {
+        // For local development with kubeconfig
+        var config = KubernetesClientConfiguration.BuildConfigFromConfigFile();
+        return new Kubernetes(config);
+    }
+});
+
+// Add HTTP client for pod communication
+builder.Services.AddHttpClient("PodRefresh", client =>
+{
+    client.DefaultRequestHeaders.Add("User-Agent", "CacheRefreshService");
+});
+
+// Add services
+builder.Services.AddScoped<KubernetesPodInfoService>();
+builder.Services.AddScoped<CacheRefreshService>();
+builder.Services.AddScoped<ICacheService, RedisCacheService>(); // Your cache service
+
+builder.Services.AddControllers();
+
+var app = builder.Build();
+
+app.MapControllers();
+app.Run();
